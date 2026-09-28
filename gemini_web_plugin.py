@@ -47,11 +47,12 @@ _DEFAULT_MODEL = "gemini-3.5-flash-lite"
 # CROP_RATIO = fraction of width/height to KEEP (crop from right + bottom).
 _CROP_RATIO = 0.88  # keep 88% → discard 12% right + 12% bottom
 
-# Appended to every gen/edit prompt automatically to push content away from crop zone.
+# Appended to every gen/edit prompt to position content away from watermark corner (bottom-right).
+# Product & action are shifted slightly to upper-left; the background must remain natural & seamless.
 _WATERMARK_PROMPT_SUFFIX = (
-    " Leave a plain, empty margin of at least 12% on the RIGHT edge and BOTTOM edge of the frame "
-    "(solid background color, no subject or text in that strip). "
-    "Main subject must be fully contained in the upper-left 88% of the frame."
+    " Compose the shot with the product and focal point positioned slightly toward the upper-left "
+    "of the frame. The entire frame must feature a continuous, natural, seamless environment and realistic lighting "
+    "throughout — do NOT generate any solid color borders, flat color bars, or artificial blank margins."
 )
 
 # Reference-cleaning directive for edit mode: remove any watermark/logo from source image
@@ -62,11 +63,12 @@ _REMOVE_WATERMARK_DIRECTIVE = (
 )
 
 
-def _crop_watermark(path: str) -> str:
+def _crop_watermark(path: str, aspect_ratio: str | None = None) -> str:
     """Crop the bottom-right watermark strip from a Gemini-generated image.
 
     Gemini bakes its logo into the bottom-right corner. We instruct the model
     to leave a blank margin there, then crop it away here.
+    If aspect_ratio == 'square', also crop to exact 1:1 square centered on the subject.
 
     Returns the same path (file is overwritten in-place).
     """
@@ -79,6 +81,12 @@ def _crop_watermark(path: str) -> str:
         new_h = int(h * _CROP_RATIO)
         # Crop from top-left: keep [0:new_w, 0:new_h]
         cropped = img.crop((0, 0, new_w, new_h))
+        if aspect_ratio == "square":
+            cw, ch = cropped.size
+            sq_size = min(cw, ch)
+            c_left = (cw - sq_size) // 2
+            c_top = (ch - sq_size) // 2
+            cropped = cropped.crop((c_left, c_top, c_left + sq_size, c_top + sq_size))
         # Convert to RGB before saving as JPEG/PNG (handle RGBA)
         if cropped.mode == "RGBA" and path.lower().endswith((".jpg", ".jpeg")):
             cropped = cropped.convert("RGB")
@@ -155,7 +163,8 @@ async def _make_client(acct: dict):
 
 async def _generate_async(prompt: str, aspect_ratio: str | None = None) -> dict:
     """Text-to-image via Gemini web."""
-    full_prompt = prompt + _WATERMARK_PROMPT_SUFFIX
+    ar_hint = " Aspect ratio: 1:1 (square)." if aspect_ratio == "square" else ""
+    full_prompt = f"{prompt.rstrip('. ')}.{ar_hint}{_WATERMARK_PROMPT_SUFFIX}"
     accounts = _load_accounts()
     last_err = None
     for attempt in range(len(accounts)):
@@ -173,7 +182,7 @@ async def _generate_async(prompt: str, aspect_ratio: str | None = None) -> dict:
                 ts = time.strftime("%Y%m%d_%H%M%S")
                 fname = f"gemweb_{ts}_{i}.png"
                 await img.save(path=str(_OUTPUT_DIR), filename=fname, verbose=False)
-                saved = _crop_watermark(str(_OUTPUT_DIR / fname))
+                saved = _crop_watermark(str(_OUTPUT_DIR / fname), aspect_ratio=aspect_ratio)
                 paths.append(saved)
             return {
                 "success": True,
