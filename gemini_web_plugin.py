@@ -54,6 +54,13 @@ _WATERMARK_PROMPT_SUFFIX = (
     "Main subject must be fully contained in the upper-left 88% of the frame."
 )
 
+# Reference-cleaning directive for edit mode: remove any watermark/logo from source image
+_REMOVE_WATERMARK_DIRECTIVE = (
+    "Strictly omit, erase, and do not reproduce any store logos, seller watermarks, copyright text, "
+    "website URLs, sample stamps, or brand labels that appear on the reference image or background. "
+    "The new image and product must be completely clean, pristine, and unbranded."
+)
+
 
 def _crop_watermark(path: str) -> str:
     """Crop the bottom-right watermark strip from a Gemini-generated image.
@@ -182,7 +189,7 @@ async def _generate_async(prompt: str, aspect_ratio: str | None = None) -> dict:
 
 async def _edit_async(prompt: str, reference_path: str) -> dict:
     """Image-to-image via Gemini web — sends reference file."""
-    full_prompt = prompt + _WATERMARK_PROMPT_SUFFIX
+    full_prompt = f"{prompt.rstrip('. ')}. {_REMOVE_WATERMARK_DIRECTIVE} {_WATERMARK_PROMPT_SUFFIX}"
     ref = pathlib.Path(reference_path)
     if not ref.exists():
         return {"success": False, "error": f"Reference file not found: {reference_path}"}
