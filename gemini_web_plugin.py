@@ -1,12 +1,13 @@
-"""Hermes plugin: Gemini Web — image generation via Google AI Pro subscription.
+"""Hermes plugin: Gemini Web — image & video generation via Google AI Pro subscription.
 
 Uses the reverse-engineered gemini-webapi library (HanaokaYuzu/Gemini-API)
 to call the Gemini web app backend. Authenticates via browser cookies,
 supports multi-account round-robin.
 
 Tools:
-  gemini_web_generate  — text-to-image
-  gemini_web_edit      — image-to-image (preserves design from reference)
+  gemini_web_generate       — text-to-image
+  gemini_web_edit           — image-to-image (preserves design from reference)
+  gemini_web_generate_video — text-to-video or image-to-video (with reference file)
 """
 from __future__ import annotations
 
@@ -30,10 +31,16 @@ except ImportError:
 _COOKIES_PATH = pathlib.Path("~/.hermes/gemini_cookies.json").expanduser()
 _OUTPUT_DIR = pathlib.Path("~/.hermes/cache/images").expanduser()
 _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+_VIDEO_DIR = pathlib.Path("~/.hermes/cache/videos").expanduser()
+_VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 
 _MAX_RETRIES_PER_ACCOUNT = 1
 _INIT_TIMEOUT = 60
 _GEN_TIMEOUT = 300  # generous — Gemini web can be slow
+
+# Default model for all generation calls.
+# Gemini 3.5 Flash Lite supports image gen + video gen via AI Pro subscription.
+_DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 # Watermark crop: Gemini web bakes a logo into bottom-right corner.
 # Strategy: prompt instructs model to leave empty margin there, then we crop it off.
@@ -150,7 +157,7 @@ async def _generate_async(prompt: str, aspect_ratio: str | None = None) -> dict:
             break
         try:
             client = await _make_client(acct)
-            resp = await client.generate_content(full_prompt)
+            resp = await client.generate_content(full_prompt, model=_DEFAULT_MODEL)
             if not resp.images:
                 raise RuntimeError("Gemini returned no images")
             _clear_cooldown(acct["label"])
@@ -188,7 +195,7 @@ async def _edit_async(prompt: str, reference_path: str) -> dict:
             break
         try:
             client = await _make_client(acct)
-            resp = await client.generate_content(full_prompt, files=[str(ref)])
+            resp = await client.generate_content(full_prompt, files=[str(ref)], model=_DEFAULT_MODEL)
             if not resp.images:
                 raise RuntimeError("Gemini returned no images (edit mode)")
             _clear_cooldown(acct["label"])
@@ -210,6 +217,66 @@ async def _edit_async(prompt: str, reference_path: str) -> dict:
             _mark_cooldown(acct["label"])
     return {"success": False, "error": last_err or "All accounts on cooldown"}
 
+
+async def _generate_video_async(prompt: str, reference_path: str | None = None) -> dict:
+    """Text-to-video or image-to-video via Gemini web (AI Pro).
+
+    Gemini may return video in response.videos (GeneratedVideo) or response.media
+    (GeneratedMedia, which also includes audio). Both are saved.
+    The save() method polls until the video is ready (206 → retry every 10s).
+    """
+    accounts = _load_accounts()
+    last_err = None
+    for attempt in range(len(accounts)):
+        acct = _next_account(accounts)
+        if acct is None:
+            break
+        try:
+            client = await _make_client(acct)
+            files = [str(reference_path)] if reference_path else None
+            resp = await client.generate_content(prompt, files=files, model=_DEFAULT_MODEL)
+
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            result_files: dict[str, str | None] = {}
+
+            # GeneratedVideo objects (pure video, no audio track)
+            for i, vid in enumerate(resp.videos or []):
+                fname = f"gemweb_video_{ts}_{i}"
+                saved = await vid.save(path=str(_VIDEO_DIR), filename=fname, verbose=False)
+                result_files[f"video_{i}"] = saved.get("video") if isinstance(saved, dict) else saved
+                if isinstance(saved, dict) and saved.get("video_thumbnail"):
+                    result_files[f"video_{i}_thumb"] = saved["video_thumbnail"]
+
+            # GeneratedMedia objects (video+audio or audio-only)
+            for i, media in enumerate(resp.media or []):
+                fname = f"gemweb_media_{ts}_{i}"
+                saved = await media.save(
+                    path=str(_VIDEO_DIR), filename=fname, verbose=False, download_type="both"
+                )
+                if isinstance(saved, dict):
+                    for k, v in saved.items():
+                        result_files[f"media_{i}_{k}"] = v
+                else:
+                    result_files[f"media_{i}_video"] = saved
+
+            if not result_files:
+                # Gemini returned text only — video gen not available for this account/region
+                raise RuntimeError(
+                    f"No video/media in response. Text: {(resp.text or '')[:200]}. "
+                    "Video generation requires AI Pro subscription and may not be available in all regions."
+                )
+
+            _clear_cooldown(acct["label"])
+            return {
+                "success": True,
+                "account": acct["label"],
+                "files": result_files,
+                "text": (resp.text or "")[:500],
+            }
+        except Exception as e:
+            last_err = f"[{acct['label']}] {type(e).__name__}: {str(e)[:300]}"
+            _mark_cooldown(acct["label"])
+    return {"success": False, "error": last_err or "All accounts on cooldown"}
 
 # ---------------------------------------------------------------------------
 # Sync wrappers (Hermes handlers are sync)
@@ -236,6 +303,17 @@ def gemini_web_generate(prompt: str, aspect_ratio: str = "square") -> dict:
 def gemini_web_edit(prompt: str, reference_path: str) -> dict:
     """Edit/transform an image via Gemini web (AI Pro). Sends reference_path as input."""
     return _run_async(_edit_async(prompt, reference_path))
+
+
+def gemini_web_generate_video(prompt: str, reference_path: str | None = None) -> dict:
+    """Generate video from text or image reference via Gemini web (AI Pro).
+
+    Text-to-video: pass prompt only.
+    Image-to-video: pass prompt + reference_path (local file path to the reference image).
+    Returns {success, files: {video_0: path, ...}, account, text}.
+    Video is saved to ~/.hermes/cache/videos/. Polls until render complete.
+    """
+    return _run_async(_generate_video_async(prompt, reference_path))
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +367,32 @@ SCHEMAS = {
             "required": ["prompt", "reference_path"],
         },
     },
+    "gemini_web_generate_video": {
+        "name": "gemini_web_generate_video",
+        "description": (
+            "Generate a short video using Google Gemini web (AI Pro subscription). "
+            "Text-to-video: pass prompt only. "
+            "Image-to-video: pass prompt + reference_path (local image file — Gemini animates it). "
+            "Requires AI Pro subscription. Polls until render complete (may take 1-3 min). "
+            "Returns {success, files: {video_0: '/path/to/video.mp4', ...}, account, text}. "
+            "Example: gemini_web_generate_video(prompt='Animate this product tote bag gently swaying', "
+            "reference_path='/tmp/product.jpg')"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "Video generation prompt. Describe motion, scene, style.",
+                },
+                "reference_path": {
+                    "type": "string",
+                    "description": "Optional: absolute path to a reference image for image-to-video mode.",
+                },
+            },
+            "required": ["prompt"],
+        },
+    },
 }
 
 
@@ -328,8 +432,28 @@ def _h_edit(args: dict, **_) -> str:
         })
 
 
+def _h_generate_video(args: dict, **_) -> str:
+    try:
+        result = gemini_web_generate_video(
+            prompt=args["prompt"],
+            reference_path=args.get("reference_path"),
+        )
+        return json.dumps(result, default=str)
+    except Exception as exc:
+        return json.dumps({
+            "error": "handler_exception",
+            "type": type(exc).__name__,
+            "message": str(exc)[:500],
+            "traceback": traceback.format_exc()[-500:],
+        })
+
+
 def register(ctx: Any) -> None:
-    for name, handler in [("gemini_web_generate", _h_generate), ("gemini_web_edit", _h_edit)]:
+    for name, handler in [
+        ("gemini_web_generate", _h_generate),
+        ("gemini_web_edit", _h_edit),
+        ("gemini_web_generate_video", _h_generate_video),
+    ]:
         ctx.register_tool(
             name=name,
             toolset="gemini_web",

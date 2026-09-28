@@ -1,5 +1,5 @@
 name: gemini-web
-version: 0.1.0
+version: 0.2.0
 kind: standalone
 description: "Generate and edit images using Google Gemini web (AI Pro subscription) with multi-account round-robin."
 requires_env: []
@@ -8,3 +8,4 @@ requires_files:
 provides_tools:
   - gemini_web_generate
   - gemini_web_edit
+  - gemini_web_generate_video
