@@ -1,0 +1,10 @@
+name: gemini-web
+version: 0.1.0
+kind: standalone
+description: "Generate and edit images using Google Gemini web (AI Pro subscription) with multi-account round-robin."
+requires_env: []
+requires_files:
+  - ~/.hermes/gemini_cookies.json
+provides_tools:
+  - gemini_web_generate
+  - gemini_web_edit
