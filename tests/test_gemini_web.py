@@ -112,5 +112,26 @@ class TestSchemas(unittest.TestCase):
         self.assertIn("reference_path", s["parameters"]["required"])
 
 
+class TestCookieRotation(unittest.TestCase):
+    """Test cookie rotation and persistence."""
+
+    def test_update_persisted_ts(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w+", delete=False) as f:
+            f.write(json.dumps([{"label": "test", "__Secure-1PSID": "fake_psid", "__Secure-1PSIDTS": "old_ts"}]))
+            f.flush()
+            temp_path = pathlib.Path(f.name)
+
+        try:
+            with patch.object(gwp, "_COOKIES_PATH", temp_path):
+                ok = gwp._update_persisted_ts("test", "fake_psid", "new_ts")
+                self.assertTrue(ok)
+                data = json.loads(temp_path.read_text())
+                self.assertEqual(data[0]["__Secure-1PSIDTS"], "new_ts")
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -56,10 +56,11 @@ _WATERMARK_PROMPT_SUFFIX = (
 )
 
 # Reference-cleaning directive for edit mode: remove any watermark/logo from source image
+# while explicitly preserving the product's primary graphic artwork/design.
 _REMOVE_WATERMARK_DIRECTIVE = (
-    "Strictly omit, erase, and do not reproduce any store logos, seller watermarks, copyright text, "
-    "website URLs, sample stamps, or brand labels that appear on the reference image or background. "
-    "The new image and product must be completely clean, pristine, and unbranded."
+    "Maintain and faithfully display the core graphic artwork, illustration, and printed typography from the reference image on the product. "
+    "Do NOT erase the main product artwork design. "
+    "Only omit and erase external seller watermarks, shop logos, copyright stamps, website URLs, or sample watermark overlays stamped onto the photo."
 )
 
 
@@ -151,13 +152,65 @@ def _clear_cooldown(label: str):
 
 
 # ---------------------------------------------------------------------------
-# Async core
+# Account management & persistent cookie auto-rotation
 # ---------------------------------------------------------------------------
+_last_rotation: dict[str, float] = {}  # label -> timestamp of last rotation
+_ROTATION_INTERVAL = 900  # auto-rotate every 15 minutes
+
+
+def _update_persisted_ts(label: str, psid: str, new_ts: str) -> bool:
+    """Atomically update __Secure-1PSIDTS in ~/.hermes/gemini_cookies.json with chmod 600."""
+    if not _COOKIES_PATH.exists() or not new_ts:
+        return False
+    try:
+        data = json.loads(_COOKIES_PATH.read_text())
+        updated = False
+        for entry in data:
+            if entry.get("label") == label or entry.get("__Secure-1PSID") == psid:
+                if entry.get("__Secure-1PSIDTS") != new_ts:
+                    entry["__Secure-1PSIDTS"] = new_ts
+                    updated = True
+        if updated:
+            tmp = _COOKIES_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=2))
+            tmp.chmod(0o600)
+            tmp.replace(_COOKIES_PATH)
+            return True
+        return False
+    except Exception:
+        return False
+
+
+async def _rotate_account_cookie(client, acct: dict) -> str | None:
+    """Rotate __Secure-1PSIDTS via Gemini internal endpoint and persist to disk."""
+    from gemini_webapi.utils.rotate_1psidts import rotate_1psidts
+    try:
+        live_session = getattr(client, "_live_client", None)
+        if not live_session:
+            return None
+        new_ts = await rotate_1psidts(live_session, verbose=False)
+        if new_ts:
+            _last_rotation[acct["label"]] = time.time()
+            _update_persisted_ts(acct["label"], acct["psid"], new_ts)
+            acct["psidts"] = new_ts
+            return new_ts
+    except Exception:
+        pass
+    return None
+
+
 async def _make_client(acct: dict):
     from gemini_webapi import GeminiClient, set_log_level
     set_log_level("WARNING")
     client = GeminiClient(acct["psid"], acct["psidts"])
     await client.init(timeout=_INIT_TIMEOUT)
+
+    # Periodic background rotation: if last rotated > 15m ago, rotate now
+    now = time.time()
+    last_rot = _last_rotation.get(acct["label"], 0)
+    if now - last_rot >= _ROTATION_INTERVAL:
+        await _rotate_account_cookie(client, acct)
+
     return client
 
 
@@ -171,6 +224,7 @@ async def _generate_async(prompt: str, aspect_ratio: str | None = None) -> dict:
         acct = _next_account(accounts)
         if acct is None:
             break
+        client = None
         try:
             client = await _make_client(acct)
             resp = await client.generate_content(full_prompt, model=_DEFAULT_MODEL)
@@ -191,14 +245,21 @@ async def _generate_async(prompt: str, aspect_ratio: str | None = None) -> dict:
                 "text": (resp.text or "")[:500],
             }
         except Exception as e:
+            # Emergency rotation attempt if auth expired
+            try:
+                if 'client' in locals():
+                    await _rotate_account_cookie(client, acct)
+            except Exception:
+                pass
             last_err = f"[{acct['label']}] {type(e).__name__}: {str(e)[:300]}"
             _mark_cooldown(acct["label"])
     return {"success": False, "error": last_err or "All accounts on cooldown"}
 
 
-async def _edit_async(prompt: str, reference_path: str) -> dict:
+async def _edit_async(prompt: str, reference_path: str, aspect_ratio: str = "square") -> dict:
     """Image-to-image via Gemini web — sends reference file."""
-    full_prompt = f"{prompt.rstrip('. ')}. {_REMOVE_WATERMARK_DIRECTIVE} {_WATERMARK_PROMPT_SUFFIX}"
+    ar_hint = " Aspect ratio: 1:1 (square)." if aspect_ratio == "square" else ""
+    full_prompt = f"{prompt.rstrip('. ')}.{ar_hint} {_REMOVE_WATERMARK_DIRECTIVE} {_WATERMARK_PROMPT_SUFFIX}"
     ref = pathlib.Path(reference_path)
     if not ref.exists():
         return {"success": False, "error": f"Reference file not found: {reference_path}"}
@@ -209,6 +270,7 @@ async def _edit_async(prompt: str, reference_path: str) -> dict:
         acct = _next_account(accounts)
         if acct is None:
             break
+        client = None
         try:
             client = await _make_client(acct)
             resp = await client.generate_content(full_prompt, files=[str(ref)], model=_DEFAULT_MODEL)
@@ -220,7 +282,7 @@ async def _edit_async(prompt: str, reference_path: str) -> dict:
                 ts = time.strftime("%Y%m%d_%H%M%S")
                 fname = f"gemweb_edit_{ts}_{i}.png"
                 await img.save(path=str(_OUTPUT_DIR), filename=fname, verbose=False)
-                saved = _crop_watermark(str(_OUTPUT_DIR / fname))
+                saved = _crop_watermark(str(_OUTPUT_DIR / fname), aspect_ratio=aspect_ratio)
                 paths.append(saved)
             return {
                 "success": True,
@@ -229,6 +291,12 @@ async def _edit_async(prompt: str, reference_path: str) -> dict:
                 "text": (resp.text or "")[:500],
             }
         except Exception as e:
+            # Emergency rotation attempt if auth expired
+            try:
+                if 'client' in locals():
+                    await _rotate_account_cookie(client, acct)
+            except Exception:
+                pass
             last_err = f"[{acct['label']}] {type(e).__name__}: {str(e)[:300]}"
             _mark_cooldown(acct["label"])
     return {"success": False, "error": last_err or "All accounts on cooldown"}
@@ -247,6 +315,7 @@ async def _generate_video_async(prompt: str, reference_path: str | None = None) 
         acct = _next_account(accounts)
         if acct is None:
             break
+        client = None
         try:
             client = await _make_client(acct)
             files = [str(reference_path)] if reference_path else None
