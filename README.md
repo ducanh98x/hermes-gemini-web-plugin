@@ -62,9 +62,11 @@ hermes gateway restart
 
 Each image takes ~30-40s.
 
-## Security
+## Security & Auto-Rotation
 
-- Cookies are stored locally (chmod 600), never logged or echoed
+- Cookies are stored locally (`chmod 600`), never logged or echoed
+- **Auto-Rotation**: Tokens (`__Secure-1PSIDTS`) are rotated periodically via Google internal endpoint with atomic file synchronization.
+- **Standby Keep-Alive**: Includes `rotate_cookies.py` script with anti-detection randomized jitter for cron scheduling.
 - Round-robin rotates accounts; failed accounts go on 2-min cooldown
 - `_crop_watermark()` is non-fatal — returns original image on any PIL error
 

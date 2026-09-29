@@ -1,5 +1,5 @@
 name: gemini-web
-version: 0.2.0
+version: "0.2.1"
 kind: standalone
 description: "Generate and edit images using Google Gemini web (AI Pro subscription) with multi-account round-robin."
 requires_env: []
